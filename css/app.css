@@ -148,7 +148,7 @@ dialog pre { white-space: pre-wrap; font-family: 'Mukta Malar', 'Jost', sans-ser
 
 /* phone */
 .tabbar { display: none; }
-@media (max-width: 760px) {
+@media (max-width: 900px) {
   .shell { padding: 12px 12px 88px; gap: 14px; }
   .side { display: none; }
   .top h1 { font-size: 20px; }
