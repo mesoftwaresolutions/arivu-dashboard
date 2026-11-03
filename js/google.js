@@ -1,7 +1,8 @@
 // Google sign-in (Google Identity Services, token model) and the Google APIs the dashboard uses:
 // Sheets (read and update the page's sheets), Drive (only files this app creates: uploads, and its own
 // hidden settings file in appDataFolder), userinfo.
-// The access token lives only in memory and sessionStorage (cleared when the browser tab closes).
+// Several Google accounts (one per page) can be signed in at once: one access token per account email,
+// kept only in memory and sessionStorage (cleared when the browser tab closes).
 
 import { CONFIG } from './config.js';
 
@@ -14,10 +15,12 @@ const SCOPES = ['openid', 'email', 'profile', ...NEEDED].join(' ');
 const SCOPE_VERSION = 2;                 // bump when SCOPES change: older saved tokens are not reused
 const SETTINGS_FILE = 'arivu-dashboard-settings.json';
 const UPLOAD_FOLDER = 'ARIVU uploads';
-const TOKEN_KEY = 'arivu.token';
+const TOKENS_KEY = 'arivu.tokens';      // {email: {access, expires, v}}
+const CURRENT_KEY = 'arivu.current';    // email of the account in use
 
 let tokenClient = null;
-let token = null;
+let memTokens = null;
+let current = null;
 
 export class AuthError extends Error {}
 
@@ -30,41 +33,74 @@ function loadScript(src) {
   });
 }
 
-function saved() {
-  try {
-    const t = JSON.parse(sessionStorage.getItem(TOKEN_KEY) || 'null');
-    return t && t.v === SCOPE_VERSION && t.expires > Date.now() + 60_000 ? t : null;
-  } catch { return null; }
+function allTokens() {
+  if (!memTokens) {
+    try { memTokens = JSON.parse(sessionStorage.getItem(TOKENS_KEY) || '{}'); } catch { memTokens = {}; }
+  }
+  return memTokens;
 }
 
-function save(t) {
-  token = t;
-  try { sessionStorage.setItem(TOKEN_KEY, JSON.stringify(t)); } catch { /* private mode: memory only */ }
+function storeTokens() {
+  try { sessionStorage.setItem(TOKENS_KEY, JSON.stringify(memTokens)); } catch { /* private mode: memory only */ }
 }
+
+const valid = (t) => Boolean(t && t.v === SCOPE_VERSION && t.expires > Date.now() + 60_000);
+
+/** Email of the account in use (or null). */
+export function currentAccount() {
+  if (current === null) { try { current = sessionStorage.getItem(CURRENT_KEY) || ''; } catch { current = ''; } }
+  return current || null;
+}
+
+function useAccount(email) {
+  current = email || '';
+  try { if (email) sessionStorage.setItem(CURRENT_KEY, email); else sessionStorage.removeItem(CURRENT_KEY); } catch { /* ignore */ }
+}
+
+/** Accounts with a usable token in this tab. */
+export function signedInAccounts() {
+  return Object.entries(allTokens()).filter(([, t]) => valid(t)).map(([email]) => email);
+}
+
+function saved() { const e = currentAccount(); return e && valid(allTokens()[e]) ? allTokens()[e] : null; }
 
 export function hasClientId() { return Boolean(CONFIG.googleClientId); }
 
-/** Ask Google for an access token. interactive=false only reuses a token saved in this tab. */
-export async function signIn({ interactive = true, hint = '' } = {}) {
+/**
+ * Use an account. hint = that account's email: reuses its token when this tab has one, else asks Google
+ * (pre-selecting it). chooseAccount = show Google's account chooser (to add another page).
+ * interactive=false never opens a popup (a popup needs a user's click).
+ */
+export async function signIn({ interactive = true, hint = '', chooseAccount = false } = {}) {
   if (!hasClientId()) throw new AuthError('This dashboard has no Google client ID yet (js/config.js).');
-  const s = saved();
-  if (s) { token = s; return s; }
-  if (!interactive) throw new AuthError('Not signed in.');      // a popup needs a user's click
+  if (!chooseAccount) {
+    const email = hint || currentAccount();
+    if (email && valid(allTokens()[email])) { useAccount(email); return allTokens()[email]; }
+  }
+  if (!interactive) throw new AuthError('Not signed in.')
   await loadScript('https://accounts.google.com/gsi/client');
   return new Promise((resolve, reject) => {
     tokenClient = google.accounts.oauth2.initTokenClient({
       client_id: CONFIG.googleClientId,
       scope: SCOPES,
-      hint,
-      prompt: '',
-      callback: (r) => {
+      hint: chooseAccount ? '' : hint,
+      prompt: chooseAccount ? 'select_account' : '',
+      callback: async (r) => {
         if (r.error) return reject(new AuthError(r.error_description || r.error));
         if (!google.accounts.oauth2.hasGrantedAllScopes(r, ...NEEDED)) {
           return reject(new AuthError('Please tick all three permissions (your sheets, files ARIVU creates, dashboard settings).'));
         }
         const t = { access: r.access_token, expires: Date.now() + Number(r.expires_in || 3600) * 1000, v: SCOPE_VERSION };
-        save(t);
-        resolve(t);
+        try {
+          const me = await (await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: `Bearer ${t.access}` } })).json();
+          if (!me.email) throw new Error('no email');
+          allTokens()[me.email] = t;
+          storeTokens();
+          useAccount(me.email);
+          resolve(t);
+        } catch {
+          reject(new AuthError('Signed in, but Google did not tell which account. Please try again.'));
+        }
       },
       error_callback: (e) => reject(new AuthError(e && e.type === 'popup_closed' ? 'Sign-in window was closed.' : 'Sign-in did not finish.')),
     });
@@ -72,15 +108,17 @@ export async function signIn({ interactive = true, hint = '' } = {}) {
   });
 }
 
-export function signOut() {
-  const t = token || saved();
-  token = null;
-  try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+/** Sign one account out (default: the one in use). Returns the email that is now in use, or null. */
+export function signOut(email = currentAccount()) {
+  const t = email ? allTokens()[email] : null;
+  if (email) { delete allTokens()[email]; storeTokens(); }
   if (t && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(t.access, () => {});
+  if (email === currentAccount()) useAccount(signedInAccounts()[0] || '');
+  return currentAccount();
 }
 
 function bearer() {
-  const t = token || saved();
+  const t = saved();
   if (!t) throw new AuthError('Signed out. Please sign in again.');
   return `Bearer ${t.access}`;
 }

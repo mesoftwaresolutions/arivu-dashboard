@@ -167,3 +167,14 @@ dialog pre { white-space: pre-wrap; font-family: 'Mukta Malar', 'Jost', sans-ser
 }
 .mobile-brand { display: none; width: 100%; align-items: center; justify-content: space-between; }
 .mobile-brand img { width: 140px; height: auto; }
+
+/* page switcher */
+.switcher select { min-height: 44px; max-width: 260px; padding: 0 36px 0 14px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--ink); font-weight: 600; cursor: pointer; }
+.mobile-switch { display: none; }
+.page-btn { flex-direction: column; align-items: flex-start; padding: 8px 16px; min-height: 52px; text-align: left; }
+@media (max-width: 900px) {
+  .mobile-switch { display: block; width: 100%; }
+  .mobile-switch .switcher select { width: 100%; max-width: none; }
+  .tools .desk-switch { display: none; }
+}

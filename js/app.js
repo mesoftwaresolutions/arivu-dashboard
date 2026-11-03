@@ -1,7 +1,7 @@
 // ARIVU dashboard app: screens, routing (#/home, #/queue, #/new, #/stats, #/alerts, #/settings) and data loading.
 import { SCHEDULE_TAB, addPost, saveSchedule, setStatus } from './actions.js';
 import { CONFIG } from './config.js';
-import { AuthError, hasClientId, loadSettings, readTabs, saveSettings, signIn, signOut, userInfo } from './google.js';
+import { AuthError, currentAccount, hasClientId, loadSettings, readTabs, saveSettings, signIn, signOut, signedInAccounts, userInfo } from './google.js';
 import { DEFAULT_SETTINGS, PLATFORMS, PLATFORM_ORDER, buildModel, compact, duration, sheetId, spark, suggestTimes, timeLabel } from './model.js';
 import { h, icon, s } from './ui.js';
 
@@ -52,31 +52,77 @@ function view() {
   return shell();
 }
 
-// ---------- sign-in ----------
-function signInView() {
-  const ready = hasClientId();
-  return h('div', { class: 'center' }, h('main', { class: 'login card' },
-    h('div', { class: 'logo' }, logo('arivu', '', ARIVU_ALT)),
-    h('h1', { style: { fontSize: '22px', fontWeight: 600 } }, 'Dashboard'),
-    h('p', { class: 'small' }, 'Sign in with your page’s Google account. Google asks for your 2-step verification.'),
-    state.error ? h('div', { class: 'banner bad', role: 'alert' }, state.error) : null,
-    ready
-      ? h('button', { class: 'btn primary', type: 'button', onclick: doSignIn }, 'Sign in with Google')
-      : h('div', { class: 'banner warn' }, 'Setup pending: the Google sign-in client is not added yet.'),
-    h('a', { href: '?demo#/home', class: 'small' }, 'See a demo with sample data'),
-    h('div', { class: 'by' }, logo('me', '', 'ME Software Solutions'), h('span', { class: 'tiny' }, 'by ME Software Solutions')),
-  ));
+// ---------- pages remembered on this device (email + page name only; no tokens) ----------
+const PAGES_KEY = 'arivu.pages';
+function knownPages() { try { return JSON.parse(localStorage.getItem(PAGES_KEY) || '[]'); } catch { return []; } }
+function rememberPage(email, name) {
+  if (!email) return;
+  const list = knownPages().filter((p) => p.email !== email);
+  list.unshift({ email, name: name || email, at: Date.now() });
+  try { localStorage.setItem(PAGES_KEY, JSON.stringify(list.slice(0, 20))); } catch { /* ignore */ }
+}
+function forgetPage(email) {
+  try { localStorage.setItem(PAGES_KEY, JSON.stringify(knownPages().filter((p) => p.email !== email))); } catch { /* ignore */ }
 }
 
-async function doSignIn() {
-  state.error = '';
+function resetPageState() {
+  Object.assign(state, { user: null, settings: null, raw: null, model: null, error: '', notice: '', picked: null, draftTimes: null });
+}
+
+/** Switch to a remembered page (instant when this tab already has its token), or add a new one. */
+async function switchTo(email) {
+  if (email === currentAccount() && state.model) return;
+  resetPageState();
   try {
-    await signIn({ interactive: true });
+    if (email) await signIn({ hint: email }); else await signIn({ chooseAccount: true });
     await afterSignIn();
   } catch (e) {
     state.error = e.message;
     render();
   }
+}
+
+function signOutHere(forget = false) {
+  const email = currentAccount();
+  if (forget) forgetPage(email);
+  const next = signOut(email);
+  resetPageState();
+  location.hash = '#/home';
+  if (next) switchTo(next); else render();
+}
+
+/** The page dropdown: every remembered page, then "Add another page". */
+function pageSwitcher(extra = '') {
+  if (DEMO) return null;
+  const me = currentAccount();
+  const pages = knownPages();
+  if (me && !pages.some((p) => p.email === me)) pages.unshift({ email: me, name: state.model?.page?.name || me });
+  const live = new Set(signedInAccounts());
+  return h('label', { class: `switcher ${extra}` }, h('span', { class: 'sr-only' }, 'Page'),
+    h('select', { 'aria-label': 'Switch page', onchange: (e) => { const v = e.target.value; if (v === '+') switchTo(''); else switchTo(v); } },
+      pages.map((p) => h('option', { value: p.email, selected: p.email === me || null }, `${p.name}${live.has(p.email) || p.email === me ? '' : ' (sign in)'}`)),
+      h('option', { value: '+' }, '＋ Add another page…')));
+}
+
+// ---------- sign-in ----------
+function signInView() {
+  const ready = hasClientId();
+  const pages = knownPages();
+  return h('div', { class: 'center' }, h('main', { class: 'login card' },
+    h('div', { class: 'logo' }, logo('arivu', '', ARIVU_ALT)),
+    h('h1', { style: { fontSize: '22px', fontWeight: 600 } }, 'Dashboard'),
+    h('p', { class: 'small' }, 'Sign in with your page’s Google account. Google asks for your 2-step verification.'),
+    state.error ? h('div', { class: 'banner bad', role: 'alert' }, state.error) : null,
+    ready && pages.length ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+      h('span', { class: 'small' }, 'Your pages on this device'),
+      pages.map((p) => h('button', { class: 'btn page-btn', type: 'button', onclick: () => switchTo(p.email) },
+        h('span', { class: 'ta' }, p.name), h('span', { class: 'tiny' }, p.email)))) : null,
+    ready
+      ? h('button', { class: 'btn primary', type: 'button', onclick: () => switchTo('') }, pages.length ? 'Sign in to another page' : 'Sign in with Google')
+      : h('div', { class: 'banner warn' }, 'Setup pending: the Google sign-in client is not added yet.'),
+    h('a', { href: '?demo#/home', class: 'small' }, 'See a demo with sample data'),
+    h('div', { class: 'by' }, logo('me', '', 'ME Software Solutions'), h('span', { class: 'tiny' }, 'by ME Software Solutions')),
+  ));
 }
 
 async function afterSignIn() {
@@ -85,6 +131,7 @@ async function afterSignIn() {
     state.user = await userInfo();
     state.settings = { ...DEFAULT_SETTINGS, ...((await loadSettings()) || {}) };
     if (sheetId(state.settings.contentSheet)) await loadData();
+    rememberPage(state.user.email, state.model?.page?.name || state.raw?.title || state.user.email);
   } catch (e) {
     if (e instanceof AuthError) state.user = null;
     state.error = e.message;
@@ -99,7 +146,7 @@ async function loadData() {
     readTabs(sheetId(st.contentSheet), [st.contentTab || 'Content', SCHEDULE_TAB]),
     sheetId(st.hubSheet) ? readTabs(sheetId(st.hubSheet), ['DailyStats', 'PostStats', 'Pages']) : Promise.resolve({}),
   ]);
-  state.raw = { contentValues: content[st.contentTab || 'Content'], scheduleValues: content[SCHEDULE_TAB], hub, now: null };
+  state.raw = { contentValues: content[st.contentTab || 'Content'], scheduleValues: content[SCHEDULE_TAB], hub, now: null, title: content._title };
   state.loadedAt = new Date();
   state.error = (content[st.contentTab || 'Content'] || []).length ? '' : `The tab “${st.contentTab}” is empty or missing in the content sheet.`;
   rebuild();
@@ -156,13 +203,15 @@ function header(title) {
   const m = state.model;
   const live = m.page.live === 'false' ? 'live: false (dry-run)' : m.page.live === 'true' ? 'live' : '';
   return [
-    h('div', { class: 'mobile-brand' }, h('div', {}, logo('arivu', '', ARIVU_ALT)), themeButton()),
+    h('div', { class: 'mobile-brand' }, h('div', {}, logo('arivu', '', ARIVU_ALT)), h('div', { class: 'row' }, themeButton())),
+    DEMO ? null : h('div', { class: 'mobile-switch' }, pageSwitcher()),
     h('header', { class: 'top' },
       h('div', {},
         h('h1', { class: 'ta' }, title || m.page.name || 'Your page'),
         h('span', { class: 'small' }, [new Date().toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }), live].filter(Boolean).join(' · ')),
       ),
       h('div', { class: 'tools' },
+        pageSwitcher('desk-switch'),
         h('div', { class: 'seg', role: 'group', 'aria-label': 'Date range' },
           [7, 30, 90].map((d) => h('button', { type: 'button', 'aria-pressed': state.range === d ? 'true' : 'false', onclick: () => { state.range = d; rebuild(); render(); } }, `${d}d`))),
         DEMO ? null : h('button', { class: 'btn icon', type: 'button', 'aria-label': 'Refresh', title: state.loadedAt ? `Updated ${state.loadedAt.toLocaleTimeString()}` : 'Refresh', onclick: refresh }, icon.refresh()),
@@ -508,8 +557,12 @@ function settingsView(first) {
     state.user ? h('p', { class: 'small' }, `Signed in as ${state.user.email}`) : null,
     state.error ? h('div', { class: 'banner bad', role: 'alert' }, state.error) : null,
     form,
-    !first ? h('div', { class: 'row' }, themeButton(), DEMO ? null : h('button', { class: 'btn', type: 'button', onclick: () => { signOut(); state.user = null; state.model = null; state.raw = null; location.hash = ''; render(); } }, 'Sign out')) : null,
-    h('p', { class: 'tiny' }, `ARIVU Dashboard ${CONFIG.version} · read-only · by ME Software Solutions`),
+    !first ? h('div', { class: 'row' }, themeButton(), DEMO ? null : [
+      h('button', { class: 'btn', type: 'button', onclick: () => signOutHere(false) }, 'Sign out of this page'),
+      h('button', { class: 'btn', type: 'button', onclick: () => { if (window.confirm('Forget this page on this device? (Nothing in Google is deleted.)')) signOutHere(true); } }, 'Forget this page here'),
+    ]) : null,
+    first && state.user ? h('button', { class: 'btn', type: 'button', onclick: () => signOutHere(false) }, 'Use a different account') : null,
+    h('p', { class: 'tiny' }, `ARIVU Dashboard ${CONFIG.version} · by ME Software Solutions`),
   ];
   if (first) return h('div', { class: 'center' }, h('main', { class: 'login card', style: { maxWidth: '560px', textAlign: 'left' } }, h('div', { class: 'logo', style: { textAlign: 'center' } }, logo('arivu', '', ARIVU_ALT)), body));
   return h('div', { class: 'col' }, header('Settings'), h('section', { class: 'card', style: { display: 'flex', flexDirection: 'column', gap: '14px', maxWidth: '640px' } }, body));
