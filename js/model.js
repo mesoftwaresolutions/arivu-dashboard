@@ -38,7 +38,7 @@ export function rowsFromValues(values) {
   for (let i = 1; i < values.length; i++) {
     const raw = values[i] || [];
     if (!raw.some((v) => String(v ?? '').trim())) continue;
-    const row = {};
+    const row = { _row: i + 1 };                       // 1-based sheet row, used when writing back
     header.forEach((h, j) => { if (h) row[h] = String(raw[j] ?? '').trim(); });
     out.push(row);
   }
@@ -138,6 +138,10 @@ function untilLabel(now, slot, tz) {
 
 /** Short human title for a content row (template fields line1/line2, else captions, else the key). */
 export function rowTitle(row, key) {
+  if (row.media_link) {
+    const first = String(row.caption_base || '').split('\n')[0].replace(/\s*#\S+/g, '').trim();
+    return [first || `Your ${row.media_type || 'post'} #${row[key]}`];
+  }
   const lines = ['line1', 'line2'].map((f) => row[f]).filter(Boolean);
   if (lines.length) return lines;
   const t = row.caption_yt_title || row.caption_pin_title || row.title || '';
@@ -153,8 +157,10 @@ function captionsOf(row) {
 }
 
 /** Everything the dashboard needs, from raw sheet values. */
-export function buildModel({ contentValues, hub, settings: s, now = new Date(), rangeDays = 7 }) {
+export function buildModel({ contentValues, hub, scheduleValues, settings: s, now = new Date(), rangeDays = 7 }) {
+  const schedule = parseSchedule(scheduleValues);
   const settings = { ...DEFAULT_SETTINGS, ...(s || {}) };
+  if (schedule.times.length) settings.publishTimes = schedule.times.join(', ');   // the sheet is the source of truth
   const tz = settings.timezone;
   const header = (contentValues && contentValues[0]) || [];
   const key = keyColumn(header);
@@ -164,14 +170,22 @@ export function buildModel({ contentValues, hub, settings: s, now = new Date(), 
   const order = (r) => { const n = num(r.post_order); return n === null ? 1e9 : n; };
 
   const postedRows = rows.filter((r) => status(r) === 'Posted');
-  const postedToday = postedRows.filter((r) => String(r.posted_at || '').startsWith(today)).length;
-  const approved = rows.filter((r) => status(r) === 'Approved').sort((a, b) => order(a) - order(b));
+  const timed = (r) => Boolean(r.publish_at);
+  const postedToday = postedRows.filter((r) => !timed(r) && String(r.posted_at || '').startsWith(today)).length;
+  const approved = rows.filter((r) => status(r) === 'Approved' && !timed(r)).sort((a, b) => order(a) - order(b));
   const slots = upcomingSlots(now, settings, postedToday, Math.max(approved.length, 1));
-  const queue = approved.map((r, i) => ({
-    key: r[key], title: rowTitle(r, key), slot: slots[i], when: slots[i] ? `${slots[i].date === today ? 'Today' : dayLabel(slots[i].date, { weekday: 'short', day: 'numeric', month: 'short' })} · ${timeLabel(slots[i].time)}` : '',
-    group: [r.pal, r.chapter_name || r.topic].filter(Boolean).join(' · '),
-    preview: r.preview_link || '', captions: captionsOf(r), notes: r.notes || '', row: r,
-  }));
+  const whenLabel = (slot) => (slot ? `${slot.date === today ? 'Today' : dayLabel(slot.date, { weekday: 'short', day: 'numeric', month: 'short' })} · ${timeLabel(slot.time)}` : '');
+  const item = (r, slot, exact) => ({
+    key: r[key], title: rowTitle(r, key), slot, when: whenLabel(slot), exact, custom: Boolean(r.media_link),
+    group: [r.pal, r.chapter_name || r.topic].filter(Boolean).join(' · ') || (r.media_link ? `Your ${r.media_type || 'post'}` : ''),
+    preview: r.preview_link || r.media_link || '', captions: captionsOf(r), notes: r.notes || '', status: status(r), row: r,
+  });
+  const exactRows = rows.filter((r) => status(r) === 'Approved' && timed(r))
+    .map((r) => item(r, { date: r.publish_at.slice(0, 10), time: r.publish_at.slice(11, 16) }, true));
+  const sortKey = (q) => (q.slot ? `${q.slot.date} ${q.slot.time}` : '9999');
+  const queue = [...approved.map((r, i) => item(r, slots[i], false)), ...exactRows].sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+  const waiting = rows.filter((r) => ['Pending', 'Rendered', 'Failed'].includes(status(r)))
+    .sort((a, b) => order(a) - order(b)).map((r) => item(r, null, false));
   const next = queue[0] ? { ...queue[0], until: untilLabel(now, queue[0].slot, tz), meaning: queue[0].row.meaning || '' } : null;
 
   const counts = {};
@@ -229,10 +243,10 @@ export function buildModel({ contentValues, hub, settings: s, now = new Date(), 
   });
 
   return {
-    key, page: { name: pageInfo.page || '', slug: pageInfo.slug || '', live: pageInfo.live || '', engine: pageInfo.engine_version || '', updated: pageInfo.updated_at || '' },
+    key, header, schedule, publishTimes: String(settings.publishTimes).split(/[\s,]+/).filter(Boolean), waiting, page: { name: pageInfo.page || '', slug: pageInfo.slug || '', live: pageInfo.live || '', engine: pageInfo.engine_version || '', updated: pageInfo.updated_at || '' },
     today, next, queue, counts, kpis, platforms, posts: allPosts, goals,
     calendar: calendar(today, rows, queue),
-    alerts: alerts(rows, key, next, pageInfo, daily, today),
+    alerts: [...schedulerAlerts(schedule, now), ...alerts(rows, key, next, pageInfo, daily, today)],
   };
 }
 
@@ -266,6 +280,18 @@ function calendar(today, rows, queue) {
   });
 }
 
+function schedulerAlerts(sc, now) {
+  if (!sc.exists) return [];
+  const out = [];
+  if (sc.paused) out.push({ kind: 'info', text: 'Publishing is paused (Schedule).', when: '' });
+  if (sc.lastError) out.push({ kind: 'bad', text: `Scheduler error: ${sc.lastError}`, when: '' });
+  const t = Date.parse(sc.lastCheck);
+  if (sc.lastCheck && Number.isFinite(t) && now - t > 90 * 60_000) {
+    out.push({ kind: 'bad', text: `Scheduler has not checked in for ${Math.round((now - t) / 60_000)} min (it runs every 30).`, when: sc.lastCheck });
+  }
+  return out;
+}
+
 function alerts(rows, key, next, pageInfo, daily, today) {
   const out = [];
   if (pageInfo.live === 'false') out.push({ kind: 'info', text: 'live: false — posts are dry-run until you go live.', when: '' });
@@ -277,6 +303,31 @@ function alerts(rows, key, next, pageInfo, daily, today) {
   const lastDay = daily.map((d) => d.date).sort().pop();
   if (lastDay) out.push({ kind: lastDay >= addDays(today, -1) ? 'good' : 'bad', text: lastDay >= addDays(today, -1) ? 'Analytics up to date' : 'Analytics not updated for 2+ days — check GitHub Actions', when: lastDay });
   return out;
+}
+
+/** The sheet's Schedule tab (key | value), as the engine and the Apps Script scheduler read it. */
+export function parseSchedule(values) {
+  const out = {};
+  (values || []).forEach((r) => { const k = String(r[0] || '').trim().toLowerCase(); if (k && k !== 'key') out[k] = String(r[1] ?? '').trim(); });
+  const times = String(out.publish_times || '').split(/[\s,]+/).filter((t) => /^\d{1,2}:\d{2}$/.test(t))
+    .map((t) => t.padStart(5, '0')).sort();
+  return {
+    exists: Boolean(values && values.length), times, paused: /^(true|yes|1|paused)$/i.test(out.paused || ''),
+    lastCheck: out.last_check || '', lastDispatch: out.last_dispatch || '', lastError: out.last_error || '',
+  };
+}
+
+/** Times for N posts a day, spread over the day (kept when they already match N). */
+export function suggestTimes(n, current = []) {
+  if (current.length === n) return current;
+  const presets = { 1: ['19:00'], 2: ['12:30', '19:00'], 3: ['09:00', '13:00', '19:00'], 4: ['08:00', '12:30', '17:00', '20:30'],
+    5: ['08:00', '11:00', '14:00', '17:00', '20:00'], 6: ['08:00', '10:30', '13:00', '15:30', '18:00', '20:30'],
+    7: ['07:30', '09:30', '11:30', '13:30', '16:00', '18:30', '21:00'] };
+  if (presets[n]) return presets[n];
+  return Array.from({ length: n }, (_, i) => {
+    const m = 7 * 60 + Math.round((i * (15 * 60)) / Math.max(n - 1, 1));
+    return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+  });
 }
 
 /** SVG polyline points for a 120×36 sparkline. */

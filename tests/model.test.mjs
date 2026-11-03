@@ -44,7 +44,7 @@ test('next post, queue and counts', () => {
   assert.deepEqual(m.next.title, ['One thing at a time', 'is the fastest way']);
   assert.ok(m.next.preview.startsWith('https://drive.google.com/'));
   assert.equal(m.next.captions[0].label, 'Instagram');
-  assert.deepEqual(m.queue.map((q) => q.key), ['104', '105', '106']);
+  assert.deepEqual(m.queue.map((q) => q.key), ['104', 'C-1103-1830', '105', '106']);   // own post at 3 Nov 18:30
   assert.equal(m.queue[1].slot.date, '2026-11-03');
   assert.equal(m.counts.Posted, 3);
   assert.equal(m.counts.Failed, 1);
@@ -88,4 +88,39 @@ test('empty sheets do not crash', () => {
 test('sparkline points', () => {
   assert.equal(spark([1, 1]), '0.0,18.0 120.0,18.0');
   assert.equal(spark([0, 10]).split(' ').length, 2);
+});
+
+import { parseSchedule, suggestTimes } from '../js/model.js';
+
+test('schedule tab, suggested times', () => {
+  const sc = parseSchedule(demo.schedule);
+  assert.deepEqual(sc.times, ['12:30', '19:00']);
+  assert.equal(sc.paused, false);
+  assert.equal(parseSchedule([['paused', 'TRUE']]).paused, true);
+  assert.equal(parseSchedule(undefined).exists, false);
+  assert.deepEqual(suggestTimes(2, []), ['12:30', '19:00']);
+  assert.deepEqual(suggestTimes(2, ['10:00', '18:00']), ['10:00', '18:00']);
+  assert.equal(suggestTimes(9, []).length, 9);
+});
+
+test('schedule tab drives the queue; own posts with a time join it; waiting list', () => {
+  const m = model({ scheduleValues: demo.schedule });
+  assert.deepEqual(m.publishTimes, ['12:30', '19:00']);
+  // 2 PM IST now: today 19:00, tomorrow 12:30 (own video at 18:30), tomorrow 19:00
+  assert.deepEqual(m.queue.map((q) => `${q.key} ${q.slot.date} ${q.slot.time}`),
+    ['104 2026-11-02 19:00', '105 2026-11-03 12:30', 'C-1103-1830 2026-11-03 18:30', '106 2026-11-03 19:00']);
+  const own = m.queue.find((q) => q.custom);
+  assert.equal(own.exact, true);
+  assert.deepEqual(own.title, ['Behind the scenes of Daily Spark 🎬']);
+  assert.equal(own.group, 'Your video');
+  assert.deepEqual(m.waiting.map((w) => `${w.key}:${w.status}`), ['107:Rendered', '108:Failed', '109:Pending']);
+  assert.equal(m.waiting[0].row._row, 8);                      // sheet row number for writing back
+});
+
+test('scheduler alerts', () => {
+  const late = model({ scheduleValues: demo.schedule, now: new Date('2026-11-02T12:00:00Z') });   // 2h after last_check... 17:30 IST
+  assert.ok(late.alerts.some((a) => a.kind === 'bad' && a.text.includes('has not checked in')));
+  const paused = model({ scheduleValues: [['paused', 'true'], ['last_error', 'HTTP 401 token']] });
+  assert.ok(paused.alerts.some((a) => a.text.includes('paused')));
+  assert.ok(paused.alerts.some((a) => a.kind === 'bad' && a.text.includes('401')));
 });

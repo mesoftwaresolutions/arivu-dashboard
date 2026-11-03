@@ -1,20 +1,21 @@
-// ARIVU dashboard app: screens, routing (#/home, #/queue, #/stats, #/alerts, #/settings) and data loading.
+// ARIVU dashboard app: screens, routing (#/home, #/queue, #/new, #/stats, #/alerts, #/settings) and data loading.
+import { SCHEDULE_TAB, addPost, saveSchedule, setStatus } from './actions.js';
 import { CONFIG } from './config.js';
 import { AuthError, hasClientId, loadSettings, readTabs, saveSettings, signIn, signOut, userInfo } from './google.js';
-import { DEFAULT_SETTINGS, PLATFORMS, buildModel, compact, duration, sheetId, spark, timeLabel } from './model.js';
+import { DEFAULT_SETTINGS, PLATFORMS, PLATFORM_ORDER, buildModel, compact, duration, sheetId, spark, suggestTimes, timeLabel } from './model.js';
 import { h, icon, s } from './ui.js';
 
 const app = document.getElementById('app');
 const params = new URLSearchParams(location.search);
 const DEMO = params.has('demo');
 const ROUTES = [
-  { id: 'home', label: 'Home' }, { id: 'queue', label: 'Queue' }, { id: 'stats', label: 'Analytics' },
-  { id: 'alerts', label: 'Alerts' }, { id: 'settings', label: 'Settings' },
+  { id: 'home', label: 'Home' }, { id: 'queue', label: 'Queue' }, { id: 'new', label: '+ New post', tab: '+ New' },
+  { id: 'stats', label: 'Analytics', tab: 'Stats' }, { id: 'alerts', label: 'Alerts' }, { id: 'settings', label: 'Settings' },
 ];
 
 const state = {
   user: null, settings: null, raw: null, model: null, error: '', loading: false,
-  picked: null, range: 7, loadedAt: null,
+  picked: null, range: 7, loadedAt: null, notice: '', busy: false, draftTimes: null,
 };
 
 // ---------- theme (per device) ----------
@@ -95,10 +96,10 @@ async function afterSignIn() {
 async function loadData() {
   const st = state.settings;
   const [content, hub] = await Promise.all([
-    readTabs(sheetId(st.contentSheet), [st.contentTab || 'Content']),
+    readTabs(sheetId(st.contentSheet), [st.contentTab || 'Content', SCHEDULE_TAB]),
     sheetId(st.hubSheet) ? readTabs(sheetId(st.hubSheet), ['DailyStats', 'PostStats', 'Pages']) : Promise.resolve({}),
   ]);
-  state.raw = { contentValues: content[st.contentTab || 'Content'], hub, now: null };
+  state.raw = { contentValues: content[st.contentTab || 'Content'], scheduleValues: content[SCHEDULE_TAB], hub, now: null };
   state.loadedAt = new Date();
   state.error = (content[st.contentTab || 'Content'] || []).length ? '' : `The tab “${st.contentTab}” is empty or missing in the content sheet.`;
   rebuild();
@@ -109,6 +110,23 @@ function rebuild() {
   state.model = buildModel({ ...state.raw, settings: state.settings, now: state.raw.now ? new Date(state.raw.now) : new Date(), rangeDays: state.range });
   if (!state.picked || !state.model.platforms.some((p) => p.id === state.picked)) state.picked = state.model.platforms[0]?.id || null;
 }
+
+/** Run a change (approve, schedule, new post), then reload. Demo mode changes only the demo data. */
+async function act(label, fn, okText) {
+  if (state.busy) return;
+  state.busy = true; state.error = ''; state.notice = `${label}…`; render();
+  try {
+    await fn({ demo: DEMO, settings: state.settings, raw: state.raw });
+    if (DEMO) rebuild(); else await loadData();
+    state.notice = `${okText}${DEMO ? ' (demo: not saved anywhere)' : ''}`;
+  } catch (e) {
+    if (e instanceof AuthError) state.user = null;
+    state.error = e.message; state.notice = '';
+  }
+  state.busy = false; render();
+}
+
+const confirmAct = (question, label, fn, okText) => { if (window.confirm(question)) act(label, fn, okText); };
 
 async function refresh() {
   if (DEMO) return;
@@ -126,12 +144,11 @@ function shell() {
     h('nav', { class: 'side', 'aria-label': 'Main' },
       h('div', { class: 'brand' }, logo('arivu', '', ARIVU_ALT), h('span', { class: 'tiny' }, `Dashboard ${CONFIG.version}${m.page.engine ? ' · Engine ' + m.page.engine : ''}`)),
       ROUTES.map(navItem),
-      h('span', { class: 'nav-item soon', title: 'Coming in phase 3' }, '+ New post (soon)'),
       h('div', { class: 'who' }, h('strong', {}, DEMO ? 'Demo' : 'Signed in'), h('br'), DEMO ? 'sample data' : (state.user?.email || '')),
       h('div', { class: 'by' }, logo('me', '', 'ME Software Solutions'), h('span', { class: 'tiny' }, 'by ME Software Solutions')),
     ),
     h('div', { class: 'main' }, page(r)),
-    h('nav', { class: 'tabbar', 'aria-label': 'Tabs' }, ROUTES.map((x) => h('a', { href: `#/${x.id}`, 'aria-current': r === x.id ? 'page' : null }, x.id === 'stats' ? 'Stats' : x.label))),
+    h('nav', { class: 'tabbar', 'aria-label': 'Tabs' }, ROUTES.map((x) => h('a', { href: `#/${x.id}`, 'aria-current': r === x.id ? 'page' : null }, x.tab || x.label))),
   );
 }
 
@@ -155,6 +172,7 @@ function header(title) {
     DEMO ? h('div', { class: 'banner warn' }, 'Demo: made-up numbers for the “Daily Spark” demo page. ', h('a', { href: './' }, 'Sign in for your page')) : null,
     state.error ? h('div', { class: 'banner bad', role: 'alert' }, state.error) : null,
     state.loading ? h('div', { class: 'banner info', role: 'status' }, 'Refreshing…') : null,
+    state.notice ? h('div', { class: 'banner info', role: 'status' }, state.notice) : null,
   ];
 }
 
@@ -164,7 +182,8 @@ function themeButton(extra = '') {
 }
 
 function page(r) {
-  if (r === 'queue') return h('div', { class: 'col' }, header('Queue'), queueTable(state.model.queue), calendarCard());
+  if (r === 'queue') return h('div', { class: 'col' }, header('Queue'), scheduleCard(), waitingTable(), queueTable(state.model.queue), calendarCard());
+  if (r === 'new') return h('div', { class: 'col' }, header('New post'), newPostForm());
   if (r === 'stats') return h('div', { class: 'col' }, header('Analytics'), kpis(), platformsSection(), postsTable(state.model.posts));
   if (r === 'alerts') return h('div', { class: 'col' }, header('Alerts'), alertsCard(), h('p', { class: 'small' }, 'Phone notifications come on Telegram in the next phase.'));
   if (r === 'settings') return settingsView(false);
@@ -188,6 +207,7 @@ function nextCard() {
       h('div', { class: 'row' },
         n.preview ? h('a', { class: 'btn primary', href: n.preview, target: '_blank', rel: 'noopener' }, 'Preview video') : h('span', { class: 'small' }, 'No preview yet (render runs on Monday).'),
         n.captions.length ? h('button', { class: 'btn', type: 'button', onclick: () => showCaptions(n) }, 'Captions') : null,
+        skipButton(n),
       ),
     ),
   );
@@ -277,19 +297,134 @@ function postsTable(posts, title = 'Post performance') {
   );
 }
 
+function skipButton(q) {
+  return h('button', { class: 'btn', type: 'button', disabled: state.busy || null, style: { color: 'var(--bad-fg)' },
+    onclick: () => confirmAct(`Skip #${q.key}? It will not be posted (you can approve it again later).`, `Skipping #${q.key}`,
+      (ctx) => setStatus(ctx, q.key, 'Skip'), `#${q.key} skipped.`) }, 'Skip');
+}
+
 function queueTable(queue, title = 'Queue') {
+  const times = state.model.publishTimes.map(timeLabel).join(', ');
   return h('section', { 'aria-label': title, style: { display: 'flex', flexDirection: 'column', gap: '12px' } },
-    h('h2', { class: 'sec' }, title, ' ', h('span', { class: 'small', style: { fontWeight: 400 } }, `· publish time ${String(state.settings?.publishTimes || '19:00').split(/[\s,]+/).map(timeLabel).join(', ')}`)),
+    h('h2', { class: 'sec' }, title, ' ', h('span', { class: 'small', style: { fontWeight: 400 } }, `· ${state.model.publishTimes.length} a day: ${times}`)),
     queue.length ? h('div', { class: 'table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, ['When', '#', 'Post', 'Group', 'Status', ''].map((t) => h('th', { scope: 'col' }, t)))),
       h('tbody', {}, queue.map((q) => h('tr', {},
-        h('td', { style: { whiteSpace: 'nowrap' } }, q.when), h('td', {}, h('strong', {}, q.key)),
+        h('td', { style: { whiteSpace: 'nowrap' } }, q.when, q.exact ? h('div', { class: 'tiny' }, 'own time') : null), h('td', {}, h('strong', {}, q.key)),
         h('td', { class: 'ta' }, q.title.join(' / ')), h('td', { class: 'ta small' }, q.group),
         h('td', {}, h('span', { class: 'pill ok' }, 'Approved')),
-        h('td', {}, q.captions.length ? h('button', { class: 'btn', type: 'button', onclick: () => showCaptions(q) }, 'Captions') : null)))),
+        h('td', {}, h('div', { class: 'row' },
+          q.captions.length ? h('button', { class: 'btn', type: 'button', onclick: () => showCaptions(q) }, 'Captions') : null,
+          skipButton(q)))))),
     )) : h('p', { class: 'small card' }, 'Nothing approved yet.'),
     h('p', { class: 'tiny' }, Object.entries(state.model.counts).map(([k, v]) => `${k}: ${v}`).join(' · ')),
   );
+}
+
+// ---------- schedule: posts per day ----------
+function scheduleCard() {
+  const sc = state.model.schedule;
+  const current = state.model.publishTimes.length ? state.model.publishTimes : ['19:00'];
+  const times = state.draftTimes || current;
+  const setCount = (n) => { state.draftTimes = suggestTimes(Math.max(1, Math.min(10, n)), times.length === n ? times : []); render(); };
+  const changed = state.draftTimes && state.draftTimes.join(',') !== current.join(',');
+  const save = (paused) => act('Saving the schedule', (ctx) => saveSchedule(ctx, [...times].sort(), paused),
+    paused ? 'Publishing paused.' : `Saved: ${times.length} post(s) a day.`).then(() => { state.draftTimes = null; render(); });
+  return h('section', { class: 'card', 'aria-label': 'Posts per day', style: { display: 'flex', flexDirection: 'column', gap: '14px' } },
+    h('div', { class: 'top' }, h('h2', { class: 'sec' }, 'Posts per day'),
+      sc.paused ? h('span', { class: 'pill warn' }, 'Paused') : h('span', { class: 'pill ok' }, sc.exists ? 'Active' : 'Not set up yet')),
+    h('div', { class: 'row' },
+      h('button', { class: 'btn icon', type: 'button', 'aria-label': 'One post less', onclick: () => setCount(times.length - 1), disabled: times.length <= 1 || null }, '−'),
+      h('strong', { style: { fontSize: '28px', minWidth: '48px', textAlign: 'center' }, 'aria-live': 'polite' }, String(times.length)),
+      h('button', { class: 'btn icon', type: 'button', 'aria-label': 'One post more', onclick: () => setCount(times.length + 1), disabled: times.length >= 10 || null }, '+'),
+      h('span', { class: 'small' }, 'posts a day, at:')),
+    h('div', { class: 'row' }, times.map((t, i) => h('label', { class: 'small', style: { display: 'flex', flexDirection: 'column', gap: '4px' } }, `Post ${i + 1}`,
+      h('input', { type: 'time', value: t, step: 300, style: { minHeight: '44px', borderRadius: '10px', border: '1px solid var(--border)', background: 'var(--surface)', padding: '0 10px' },
+        onchange: (e) => { const next = [...times]; next[i] = e.target.value; state.draftTimes = next; render(); } })))),
+    h('div', { class: 'row' },
+      h('button', { class: 'btn primary', type: 'button', disabled: (!changed && sc.exists) || state.busy || null, onclick: () => save(sc.paused) }, 'Save times'),
+      changed ? h('button', { class: 'btn', type: 'button', onclick: () => { state.draftTimes = null; render(); } }, 'Undo') : null,
+      h('button', { class: 'btn', type: 'button', disabled: state.busy || null, onclick: () => save(!sc.paused) }, sc.paused ? 'Resume publishing' : 'Pause publishing')),
+    h('p', { class: 'tiny' }, 'Times are India time. The scheduler checks every 30 minutes, so a post goes out up to 30 minutes after its time.',
+      sc.lastCheck ? ` Last check: ${sc.lastCheck.replace('T', ' ').slice(0, 16)}.` : ''),
+  );
+}
+
+// ---------- waiting for approval ----------
+function waitingTable() {
+  const list = state.model.waiting;
+  return h('section', { 'aria-label': 'Waiting for approval', style: { display: 'flex', flexDirection: 'column', gap: '12px' } },
+    h('h2', { class: 'sec' }, 'Waiting for your approval ', h('span', { class: 'small', style: { fontWeight: 400 } }, `· ${list.length}`)),
+    list.length ? h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['#', 'Post', 'Status', ''].map((t) => h('th', { scope: 'col' }, t)))),
+      h('tbody', {}, list.map((w) => h('tr', {},
+        h('td', {}, h('strong', {}, w.key)),
+        h('td', { class: 'ta' }, w.title.join(' / '), w.group ? h('div', { class: 'tiny' }, w.group) : null,
+          w.row.error ? h('div', { class: 'tiny', style: { color: 'var(--bad-fg)' } }, w.row.error) : null),
+        h('td', {}, h('span', { class: `pill ${w.status === 'Failed' ? 'bad' : w.status === 'Rendered' ? 'info' : 'warn'}` }, w.status)),
+        h('td', {}, h('div', { class: 'row' },
+          w.preview ? h('a', { class: 'btn', href: w.preview, target: '_blank', rel: 'noopener' }, 'Preview') : null,
+          w.captions.length ? h('button', { class: 'btn', type: 'button', onclick: () => showCaptions(w) }, 'Captions') : null,
+          h('button', { class: 'btn primary', type: 'button', disabled: state.busy || null,
+            onclick: () => act(`Approving #${w.key}`, (ctx) => setStatus(ctx, w.key, 'Approved'), `#${w.key} approved.`) }, 'Approve'),
+          h('button', { class: 'btn', type: 'button', disabled: state.busy || null, style: { color: 'var(--bad-fg)' },
+            onclick: () => confirmAct(`Skip #${w.key}? It will not be posted.`, `Skipping #${w.key}`, (ctx) => setStatus(ctx, w.key, 'Skip'), `#${w.key} skipped.`) }, 'Skip')))))),
+    )) : h('p', { class: 'small card' }, 'Nothing is waiting. New kurals appear here after the Monday render.'),
+  );
+}
+
+// ---------- + New post ----------
+function newPostForm() {
+  const platforms = state.model.platforms.length ? state.model.platforms.map((p) => p.id) : PLATFORM_ORDER;
+  const today = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const defaultDay = `${today.getFullYear()}-${p2(today.getMonth() + 1)}-${p2(today.getDate())}`;
+  const input = { minHeight: '44px', borderRadius: '10px', border: '1px solid var(--border)', background: 'var(--surface)', padding: '0 12px' };
+  const progress = h('progress', { max: 100, value: 0, style: { width: '100%', display: 'none' }, 'aria-label': 'Upload progress' });
+  const preview = h('div', { class: 'small' });
+  const form = h('form', { class: 'card settings', style: { maxWidth: '720px' }, onsubmit: async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const file = f.get('file');
+    if (!file || !file.size) { state.error = 'Choose a photo or video first.'; render(); return; }
+    if (file.size > 300 * 1024 * 1024) { state.error = 'The file is over 300 MB. Please make it smaller.'; render(); return; }
+    const when = f.get('when');
+    const post = {
+      file, caption: f.get('caption') || '', hashtags: f.get('hashtags') || '', approve: f.get('approve') === 'on',
+      platforms: platforms.filter((p) => f.get(`p_${p}`) === 'on'), when, at: `${f.get('day')} ${f.get('time')}`,
+    };
+    if (!post.platforms.length) { state.error = 'Choose at least one platform.'; render(); return; }
+    if (!post.caption.trim()) { state.error = 'Write a caption.'; render(); return; }
+    if (when === 'at' && !(f.get('day') && f.get('time'))) { state.error = 'Choose the date and time.'; render(); return; }
+    progress.style.display = 'block';
+    await act('Uploading your post', (ctx) => addPost(ctx, post, (x) => { progress.value = Math.round(x * 100); }),
+      post.approve ? 'Added and approved. It is in the queue.' : 'Added. Approve it in Queue → Waiting for your approval.');
+    if (!state.error) location.hash = '#/queue';
+  } },
+  h('label', {}, 'Photo or video',
+    h('input', { name: 'file', type: 'file', accept: 'image/*,video/*', required: true, style: { ...input, padding: '10px 12px' },
+      onchange: (e) => { const x = e.target.files[0]; preview.textContent = x ? `${x.type.startsWith('video/') ? 'Video' : 'Photo'} · ${(x.size / 1048576).toFixed(1)} MB` : ''; } }),
+    preview,
+    h('span', { class: 'hint' }, 'ARIVU makes it fit each platform: videos become 9:16 (1080×1920), photos 4:5. YouTube takes videos only.')),
+  h('label', {}, 'Caption', h('textarea', { name: 'caption', rows: 6, required: true, style: { ...input, padding: '10px 12px', resize: 'vertical' },
+    placeholder: 'First line is also the YouTube / Pinterest title.' }),
+  h('span', { class: 'hint' }, 'ARIVU adds the page CTA, helpline (when needed) and hashtags, and keeps each platform’s limits (Instagram 5 hashtags, Threads 500 characters).')),
+  h('label', {}, 'Hashtags', h('input', { name: 'hashtags', type: 'text', placeholder: '#Tamil #Motivation', style: input })),
+  h('fieldset', { style: { border: '1px solid var(--border)', borderRadius: '12px', padding: '12px' } }, h('legend', {}, 'Platforms'),
+    h('div', { class: 'row' }, platforms.map((p) => h('label', { style: { flexDirection: 'row', alignItems: 'center', gap: '8px', minHeight: '44px' } },
+      h('input', { type: 'checkbox', name: `p_${p}`, checked: true }), PLATFORMS[p].name)))),
+  h('fieldset', { style: { border: '1px solid var(--border)', borderRadius: '12px', padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px' } }, h('legend', {}, 'When'),
+    [['next', 'Next free slot (before the queue)'], ['end', 'End of the queue'], ['at', 'At a date and time']].map(([v, l], i) =>
+      h('label', { style: { flexDirection: 'row', alignItems: 'center', gap: '8px', minHeight: '44px' } }, h('input', { type: 'radio', name: 'when', value: v, checked: i === 0 }), l)),
+    h('div', { class: 'row' }, h('input', { type: 'date', name: 'day', value: defaultDay, style: input, 'aria-label': 'Date' }),
+      h('input', { type: 'time', name: 'time', value: '18:30', step: 300, style: input, 'aria-label': 'Time' }))),
+  h('label', { style: { flexDirection: 'row', alignItems: 'center', gap: '8px', minHeight: '44px' } }, h('input', { type: 'checkbox', name: 'approve', checked: true }), 'Approve now (otherwise it waits in Queue for your approval)'),
+  progress,
+  h('button', { class: 'btn primary', type: 'submit', disabled: state.busy || null }, 'Upload and add'),
+  DEMO ? h('p', { class: 'tiny' }, 'Demo: nothing is uploaded; the post is added to the demo data only.') : null,
+  !DEMO && !state.settings.robotEmail ? h('div', { class: 'banner warn' }, 'Add the robot (service account) email in Settings before uploading.') : null,
+  );
+  return form;
 }
 
 function calendarCard() {
@@ -341,7 +476,7 @@ function settingsView(first) {
     const f = new FormData(e.target);
     const next = {
       contentSheet: f.get('contentSheet').trim(), hubSheet: f.get('hubSheet').trim(), contentTab: f.get('contentTab').trim() || 'Content',
-      publishTimes: f.get('publishTimes').trim() || '19:00', timezone: f.get('timezone').trim() || 'Asia/Kolkata',
+      publishTimes: st.publishTimes, robotEmail: f.get('robotEmail').trim(), timezone: f.get('timezone').trim() || 'Asia/Kolkata',
       goals: [
         { platform: 'youtube', label: `YouTube: ${compact(Number(f.get('goalYt')) || 1000)} subscribers`, target: Number(f.get('goalYt')) || 1000 },
         { platform: 'instagram', label: `Instagram: ${compact(Number(f.get('goalIg')) || 10000)} followers`, target: Number(f.get('goalIg')) || 10000 },
@@ -361,7 +496,7 @@ function settingsView(first) {
   field('contentSheet', 'Content sheet link', st.contentSheet, 'The page’s Google Sheet with the posts (Content tab).'),
   field('contentTab', 'Content tab name', st.contentTab),
   field('hubSheet', 'Analytics hub sheet link', st.hubSheet, '“ARIVU Hub – <Page>”: DailyStats, PostStats, Pages tabs.'),
-  field('publishTimes', 'Publish time(s)', st.publishTimes, 'Same as schedule.publish_times_ist in page.yml, e.g. 19:00 (or 09:00, 19:00).'),
+  field('robotEmail', 'Robot (service account) email', st.robotEmail, 'The page’s service account (…@….iam.gserviceaccount.com). Your uploads are shared with it so ARIVU can post them.', 'email'),
   field('timezone', 'Time zone', st.timezone),
   field('goalYt', 'Goal: YouTube subscribers', goal(0).target, '', 'number'),
   field('goalIg', 'Goal: Instagram followers', goal(1).target, '', 'number'),
@@ -390,7 +525,7 @@ async function start() {
   if (DEMO) {
     const demo = await (await fetch('demo/demo-data.json')).json();
     state.settings = { ...DEFAULT_SETTINGS, ...demo.settings };
-    state.raw = { contentValues: demo.content, hub: demo.hub, now: params.get('demo') === 'live' ? null : demo.now };
+    state.raw = { contentValues: demo.content, scheduleValues: demo.schedule, hub: demo.hub, now: params.get('demo') === 'live' ? null : demo.now };
     rebuild();
     render();
     return;

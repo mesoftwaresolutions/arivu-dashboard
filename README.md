@@ -4,17 +4,19 @@
 
 An installable web app (PWA) for pages run by the [ARIVU engine](https://github.com/mesoftwaresolutions/arivu-engine)
 (private): next post, queue and calendar, followers and views per platform, post performance,
-alerts and goals. Phone and computer, light and dark.
+alerts and goals; **posts per day** (the sheet's Schedule tab), **Approve / Skip**, and **+ New post**
+(upload your own photo or video with a caption, platforms and time). Phone and computer, light and dark.
 
 - **Demo (sample data, no sign-in):** `https://mesoftwaresolutions.github.io/arivu-dashboard/?demo`
-- **Read-only.** Approving, skipping and new posts come in a later version.
 
 ## How it works
 
 - Static files on GitHub Pages; no server, no database, no cost.
 - **Sign in with Google** in the browser (the page's own Google account, with its 2-step verification).
-  Scopes: `spreadsheets.readonly` (read the page's sheets) and `drive.appdata` (this app's own hidden
-  settings file). The token stays in the browser tab only.
+  Scopes: `spreadsheets` (read the page's sheets; write status, the Schedule tab and new post rows),
+  `drive.file` (only files this app creates: the "ARIVU uploads" folder and your uploads, each shared
+  read-only with the page's service account so the engine can post it) and `drive.appdata` (this
+  app's own hidden settings file). The token stays in the browser tab only.
 - The app reads the page's **Content sheet** and **analytics hub** (DailyStats, PostStats, Pages)
   directly from Google Sheets. It can read only what that Google account can open.
 - Settings (sheet links, publish times, goals) are saved in the account's hidden Drive app folder,

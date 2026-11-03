@@ -1,9 +1,9 @@
 // Service worker: keeps the app shell (HTML, CSS, JS, icons) for fast and offline starts.
 // Google APIs and sign-in always go to the network and are never cached.
-const CACHE = 'arivu-shell-v0.1.2';
+const CACHE = 'arivu-shell-v0.2.0';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
-  'js/app.js', 'js/config.js', 'js/google.js', 'js/model.js', 'js/ui.js',
+  'js/actions.js', 'js/app.js', 'js/config.js', 'js/google.js', 'js/model.js', 'js/ui.js',
   'icons/arivu-dark.png', 'icons/arivu-light.png', 'icons/me-dark.png', 'icons/me-light.png',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/favicon-64.png',
 ];
