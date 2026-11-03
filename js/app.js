@@ -41,7 +41,7 @@ function route() { const r = (location.hash.match(/^#\/(\w+)/) || [])[1]; return
 
 function render() {
   app.replaceChildren(view());
-  document.title = `${state.model?.page?.name ? state.model.page.name + ' · ' : ''}ARIVU Dashboard`;
+  document.title = `${state.model ? pageName() + ' · ' : ''}ARIVU Dashboard`;
 }
 
 function view() {
@@ -52,13 +52,49 @@ function view() {
   return shell();
 }
 
-// ---------- pages remembered on this device (email + page name only; no tokens) ----------
+// ---------- page name and logo ----------
+function pageName() { return state.settings?.nickname || state.model?.page?.name || state.raw?.title || 'Your page'; }
+
+function initials(name) {
+  const words = String(name || '?').replace(/[•|·]/g, ' ').split(/\s+/).filter(Boolean);
+  return ((words[0] || '?')[0] + (words[1] ? words[1][0] : '')).toUpperCase();
+}
+
+/** Logo: the owner's upload, else the Google account photo, else initials. */
+function pageLogo(size = 40, logoUrl = state.settings?.logo || state.user?.picture || '', name = pageName()) {
+  const box = { width: `${size}px`, height: `${size}px`, borderRadius: '50%', flex: `0 0 ${size}px` };
+  if (logoUrl) return h('img', { src: logoUrl, alt: '', referrerpolicy: 'no-referrer', style: { ...box, objectFit: 'cover', border: '1px solid var(--border)' } });
+  return h('span', { 'aria-hidden': 'true', style: { ...box, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    background: 'var(--btn-bg)', color: 'var(--btn-fg)', fontWeight: 700, fontSize: `${Math.round(size * 0.4)}px` } }, initials(name));
+}
+
+/** A picked image → square 128 px JPEG data URL (small enough for the settings file). */
+function shrinkImage(file, size = 128) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const side = Math.min(img.width, img.height);
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, size, size);
+      ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
+      URL.revokeObjectURL(img.src);
+      resolve(c.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => reject(new Error('That file is not an image ARIVU can read.'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// ---------- pages remembered on this device (email, page name, small logo; no tokens) ----------
 const PAGES_KEY = 'arivu.pages';
 function knownPages() { try { return JSON.parse(localStorage.getItem(PAGES_KEY) || '[]'); } catch { return []; } }
-function rememberPage(email, name) {
+function rememberPage(email, name, logo = '') {
   if (!email) return;
   const list = knownPages().filter((p) => p.email !== email);
-  list.unshift({ email, name: name || email, at: Date.now() });
+  list.unshift({ email, name: name || email, logo, at: Date.now() });
   try { localStorage.setItem(PAGES_KEY, JSON.stringify(list.slice(0, 20))); } catch { /* ignore */ }
 }
 function forgetPage(email) {
@@ -96,7 +132,7 @@ function pageSwitcher(extra = '') {
   if (DEMO) return null;
   const me = currentAccount();
   const pages = knownPages();
-  if (me && !pages.some((p) => p.email === me)) pages.unshift({ email: me, name: state.model?.page?.name || me });
+  if (me && !pages.some((p) => p.email === me)) pages.unshift({ email: me, name: pageName() });
   const live = new Set(signedInAccounts());
   return h('label', { class: `switcher ${extra}` }, h('span', { class: 'sr-only' }, 'Page'),
     h('select', { 'aria-label': 'Switch page', onchange: (e) => { const v = e.target.value; if (v === '+') switchTo(''); else switchTo(v); } },
@@ -116,7 +152,9 @@ function signInView() {
     ready && pages.length ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
       h('span', { class: 'small' }, 'Your pages on this device'),
       pages.map((p) => h('button', { class: 'btn page-btn', type: 'button', onclick: () => switchTo(p.email) },
-        h('span', { class: 'ta' }, p.name), h('span', { class: 'tiny' }, p.email)))) : null,
+        pageLogo(36, p.logo || '', p.name),
+        h('span', { style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-start' } },
+          h('span', { class: 'ta' }, p.name), h('span', { class: 'tiny' }, p.email))))) : null,
     ready
       ? h('button', { class: 'btn primary', type: 'button', onclick: () => switchTo('') }, pages.length ? 'Sign in to another page' : 'Sign in with Google')
       : h('div', { class: 'banner warn' }, 'Setup pending: the Google sign-in client is not added yet.'),
@@ -131,7 +169,7 @@ async function afterSignIn() {
     state.user = await userInfo();
     state.settings = { ...DEFAULT_SETTINGS, ...((await loadSettings()) || {}) };
     if (sheetId(state.settings.contentSheet)) await loadData();
-    rememberPage(state.user.email, state.model?.page?.name || state.raw?.title || state.user.email);
+    rememberPage(state.user.email, pageName(), state.settings.logo || state.user.picture || '');
   } catch (e) {
     if (e instanceof AuthError) state.user = null;
     state.error = e.message;
@@ -207,7 +245,8 @@ function header(title) {
     DEMO ? null : h('div', { class: 'mobile-switch' }, pageSwitcher()),
     h('header', { class: 'top' },
       h('div', {},
-        h('h1', { class: 'ta' }, title || m.page.name || 'Your page'),
+        h('div', { class: 'row', style: { flexWrap: 'nowrap' } }, title ? null : pageLogo(44),
+          h('h1', { class: 'ta' }, title || pageName())),
         h('span', { class: 'small' }, [new Date().toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }), live].filter(Boolean).join(' · ')),
       ),
       h('div', { class: 'tools' },
@@ -523,7 +562,14 @@ function settingsView(first) {
   const form = h('form', { class: 'settings', onsubmit: async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
+    let logo = st.logo || '';
+    if (f.get('logoRemove') === 'on') logo = '';
+    const logoFile = f.get('logoFile');
+    if (logoFile && logoFile.size) {
+      try { logo = await shrinkImage(logoFile); } catch (err) { state.error = err.message; render(); return; }
+    }
     const next = {
+      nickname: f.get('nickname').trim(), logo,
       contentSheet: f.get('contentSheet').trim(), hubSheet: f.get('hubSheet').trim(), contentTab: f.get('contentTab').trim() || 'Content',
       publishTimes: st.publishTimes, robotEmail: f.get('robotEmail').trim(), timezone: f.get('timezone').trim() || 'Asia/Kolkata',
       goals: [
@@ -542,6 +588,12 @@ function settingsView(first) {
     } catch (err) { state.error = err.message; }
     state.loading = false; render();
   } },
+  field('nickname', 'Page name (shown in this dashboard)', st.nickname, `Leave empty to use “${state.model?.page?.name || 'the name in page.yml'}”.`),
+  h('label', {}, 'Page logo',
+    h('div', { class: 'row' }, pageLogo(56, st.logo || state.user?.picture || '', st.nickname || state.model?.page?.name),
+      h('input', { name: 'logoFile', type: 'file', accept: 'image/*', style: { padding: '10px 0' } })),
+    h('span', { class: 'hint' }, st.logo ? 'Your uploaded logo.' : state.user?.picture ? 'Now: the Google account photo. Upload a logo to use it instead.' : 'Now: initials. Upload a logo to use it instead.')),
+  st.logo ? h('label', { style: { flexDirection: 'row', alignItems: 'center', gap: '8px', minHeight: '44px' } }, h('input', { type: 'checkbox', name: 'logoRemove' }), 'Remove my uploaded logo') : null,
   field('contentSheet', 'Content sheet link', st.contentSheet, 'The page’s Google Sheet with the posts (Content tab).'),
   field('contentTab', 'Content tab name', st.contentTab),
   field('hubSheet', 'Analytics hub sheet link', st.hubSheet, '“ARIVU Hub – <Page>”: DailyStats, PostStats, Pages tabs.'),
